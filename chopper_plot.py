@@ -21,6 +21,7 @@ DATA_FOLDER = '/tmp'
 
 import sys
 import csv
+import json
 import numpy as np
 import plotly.graph_objects as go
 import plotly.io as pio
@@ -64,123 +65,167 @@ def calculate_static_measures(file_path):
                             float(row["accel_z"])] for row in csv.DictReader(file)])
         return static.mean(axis=0)
 
-
-def main():
-    print('Start tracking')
-    args = parse_arguments()
-    accelerometer = args.get('accel_chip')
-    driver = args.get('driver')
-    iterations = args.get('iterations')
-    sense_resistor = round(float(args.get('sense_resistor')), 3)
-    current_date = datetime.now().strftime('%Y%m%d_%H%M%S')
-    params = []
-    for current in range(args.get('current_min_ma'), args.get('current_max_ma') + 1, args.get('current_change_step')):
-        for tbl in range(args.get('tbl_min'), args.get('tbl_max') + 1):
-            for toff in range(args.get('toff_min'), args.get('toff_max') + 1):
-                for hstrt in range(args.get('hstrt_min'), args.get('hstrt_max') + 1):
-                    for hend in range(args.get('hend_min'), args.get('hend_max') + 1):
-                        if hstrt + hend <= args.get('hstrt_hend_max'):
-                            for tpfd in range(args.get('tpfd_min'), args.get('tpfd_max') + 1):
-                                for speed in range(args.get('min_speed') * 100, args.get('max_speed') * 100 + 1,
-                                                   args.get('speed_change_step')):
-                                    for _ in range(iterations):
-                                        freq = float(round(1/(2*(12+32*toff)*1/(1000000*FCLK)+2*1/(1000000*FCLK)*16*(1.5**tbl))/1000, 1))
-                                        parameters = (f'current={current}_tbl={tbl}_toff={toff}_hstrt={hstrt}'
-                                                      f'_hend={hend}_tpfd={tpfd}_speed={speed / 100}_freq={freq}kHz')
-                                        params.append(parameters)
-
+def klippy_write(msg):
     klippy = serial.Serial(os.path.expanduser('~/printer_data/comms/klippy.serial'), 115200)
-    running = True
-    datapoint = []
-    results = []
-    params_line = 0
+    klippy.write(msg)
+
+def dir_listener(path):
     timer = 0
-    while running:
+    while True:
         time.sleep(DELAY)
         if timer / DELAY > 2:
             print(f'Wait new file {round(timer * DELAY)} sec')
         timer += 1
-        for f in os.listdir(DATA_FOLDER):
-            if f.endswith('stand_still.csv'):
-                timer = 0
-                time.sleep(OPEN_DELAY)
-                static = calculate_static_measures(os.path.join(DATA_FOLDER, f))
-                print('Calculated static measures')
-            elif f.endswith('.csv'):
-                timer = 0
-                time.sleep(OPEN_DELAY)
-                print('Receiving csv')
-                file_path = os.path.join(DATA_FOLDER, f)
-                with open(file_path, 'r') as csv_file:
-                    data = np.array([[float(row["accel_x"]),
-                                        float(row["accel_y"]),
-                                        float(row["accel_z"])] for row in csv.DictReader(csv_file)]) - static
 
-                    trim_size = len(data) // CUTOFF_RANGE
-                    data = data[trim_size:-trim_size]
-                    md_magnitude = np.median([np.linalg.norm(row) for row in data])
-                    datapoint.append(md_magnitude)
-                    if len(datapoint) == iterations:
-                        toff = int(params[params_line].split('_')[2].split('=')[1])
-                        results.append({'parameters': params[params_line], 'median magnitude': np.mean(datapoint), 'color': toff})
-                        datapoint = []
-                        params_line += iterations
-                        if params_line == len(params):
-                            print('Last csv received, launching plotter')
-                            running = False
-            elif timer >= TIMER / DELAY:
-                print('TIMER OUT')
-                klippy.write(f'RESPOND TYPE=error MSG="WARNING!!! TIMER OUT" \n'.encode('utf-8'))
-                raise
-            else:
+        for f in os.listdir(path):
+            if not f.endswith(".csv"):
                 continue
-            cleaner()
-            break
+            timer = 0
+            file_path = os.path.join(path, f)
+            if f.endswith('chopper-end.csv'):
+                os.remove(file_path)
+                print('Last csv received, launching plotter')
+                return None
+
+            yield file_path
+
+        if timer >= TIMER / DELAY:
+            print('TIMER OUT')
+            klippy_write(f'RESPOND TYPE=error MSG="WARNING!!! TIMER OUT" \n'.encode('utf-8'))
+            raise
+
+def main(database_dir):
+    print('Start tracking')
+    current_date = datetime.now().strftime('%Y%m%d_%H%M%S')
+    results = {}
+    accelerometer = ""
+    driver = ""
+    rsense = 0
+    database_path = ""
+    for file_path in dir_listener(DATA_FOLDER):
+        if file_path.endswith('stand_still.csv'):
+            time.sleep(OPEN_DELAY)
+            static = calculate_static_measures(file_path)
+            print('Calculated static measures')
+            os.remove(file_path)
+            continue
+
+        if file_path.endswith('.csv'):
+            time.sleep(OPEN_DELAY)
+            print(f'Receiving csv: {file_path}')
+            file_name = os.path.splitext(os.path.basename(file_path))[0]
+            params = {}
+            for item in file_name.split('-'):
+                if '_' in item:
+                    key = item.split('_')[0]
+                    value_raw = item.split('_')[1]
+                    value = value_raw.replace('dot', '.').replace('minus', '-')
+                    params[key] = value
+
+            # overwrited "global" in each loop =(
+            accelerometer = params["chip"]
+            driver = params["driver"]
+            rsense = round(float(params["rsense"]), 3)
+
+            current = float(params["current"])
+            tbl = int(params["tbl"])
+            toff = int(params["toff"])
+            hstrt = int(params["hstrt"])
+            hend = int(params["hend"])
+            speed = float(params["speed"])
+            tpfd = int(params["tpfd"])
+
+
+            freq = float(round(1/(2*(12+32*toff)*1/(1000000*FCLK)+2*1/(1000000*FCLK)*16*(1.5**tbl))/1000, 1))
+            params["freq"] = freq
+
+            parameters = (f'current={current} tbl={tbl} toff={toff} hstrt={hstrt} '
+                            f'hend={hend} tpfd={tpfd} speed={speed} freq={freq}kHz')
+
+            with open(file_path, 'r') as csv_file:
+                data = np.array([[float(row["accel_x"]),
+                                    float(row["accel_y"]),
+                                    float(row["accel_z"])] for row in csv.DictReader(csv_file)]) - static
+
+                trim_size = len(data) // CUTOFF_RANGE
+                data = data[trim_size:-trim_size]
+                md_magnitude = np.median([np.linalg.norm(row) for row in data])
+                if results.get(parameters) is None:
+                    results[parameters] = {'datapoints': [md_magnitude], 'color': toff}
+                else:
+                    # This is other iteration
+                    datapoints = results[parameters]['datapoints']
+                    datapoints.append(md_magnitude)
+                    results[parameters]['datapoints'] = datapoints
+
+            database_path = os.path.join(database_dir, f".{accelerometer}-{driver}-{rsense}.db")
+            with open(database_path, mode="a+") as fd:
+                record = {
+                    "parameters": parameters,
+                    "datapoints": results[parameters]["datapoints"],
+                    "color": toff
+                }
+                fd.write(json.dumps(record) + '\n')
+                os.remove(file_path)
 
     # Group result in csv
-    if SAVE_RESULT_IN_CSV:
-        results_csv_path = os.path.join(RESULTS_FOLDER,f'median_magnitudes_{accelerometer}_tmc{driver}_{sense_resistor}_{current_date}.csv')
-        with open(results_csv_path, 'w', newline='') as csvfile:
-            writer = csv.DictWriter(csvfile, fieldnames=['median magnitude', 'parameters'])
-            writer.writeheader()
-            for result in results:
-                writer.writerow({key: value for key, value in result.items() if key != 'color'})
+    # if SAVE_RESULT_IN_CSV:
+    #     results_csv_path = os.path.join(RESULTS_FOLDER,f'median_magnitudes_{accelerometer}_tmc{driver}_{rsense}_{current_date}.csv')
+    #     with open(results_csv_path, 'w', newline='') as csvfile:
+    #         writer = csv.DictWriter(csvfile, fieldnames=['median magnitude', 'parameters'])
+    #         writer.writeheader()
+    #         for result in results:
+    #             writer.writerow({key: value for key, value in result.items() if key != 'color'})
 
     # Graphs generation
+    del results
+    results = {}
+    print(f'Load persistent database: {database_path}')
+    klippy_write(f'Load persistent database: {database_path} \r\n'.encode('utf-8'))
+    with open(database_path, mode="r") as fd:
+        for record_json in fd.readlines():
+            record = json.loads(record_json)
+            parameters = record["parameters"]
+            # Replace duplicated/updated data by new record
+            results[parameters] = record
+
     print('Magnitude graphs generation...')
-    klippy.write(f'M118 Magnitude graphs generation... \r\n'.encode('utf-8'))
+    klippy_write(f'M118 Magnitude graphs generation... \r\n'.encode('utf-8'))
     colors = ['', '#2F4F4F', '#12B57F', '#9DB512', '#DF8816', '#1297B5', '#5912B5', '#B51284', '#127D0C']
-    lists = [results, sorted(results, key=lambda x: x['median magnitude'])]
-    names = ['', 'sorted_']
-    for param, name in zip(lists, names):
+
+    result_list = []
+    for parameters in results:
+        datapoints = results[parameters]["datapoints"]
+        result_list.append({'parameters': parameters, 'median magnitude': np.mean(datapoints), 'color': toff})
+
+    graphs = {
+        'interactive': result_list,
+        'interactive_sorted': sorted(result_list, key=lambda x: x['median magnitude'])
+    }
+    for name in graphs:
         fig = go.Figure()
-        for entry in param:
-            fig.add_trace(go.Bar(x=[entry['median magnitude']], y=[entry['parameters']],
-                                 marker_color=colors[entry['color'] if entry['color'] <= 8 else entry['color'] - 8],
-                                 orientation='h', showlegend=False))
+        for entry in graphs[name]:
+            marker_color =  colors[entry['color'] % 9]
+            mean_magnitude = entry['median magnitude']
+            chopper = entry['parameters']
+            fig.add_trace(go.Bar(x=[mean_magnitude],
+                                 y=[chopper],
+                                 marker_color=marker_color,
+                                 orientation='h',
+                                 showlegend=False))
         fig.update_layout(title='Median Magnitude vs Parameters', xaxis_title='Median Magnitude',
                           yaxis_title='Parameters', coloraxis_showscale=True)
-        plot_html_path = os.path.join(RESULTS_FOLDER, f'{name}interactive_plot_{accelerometer}_tmc{driver}_{sense_resistor}_{current_date}.html')
+        plot_html_path = os.path.join(RESULTS_FOLDER, f'{name}_{accelerometer}_tmc{driver}_{rsense}_{current_date}.html')
         pio.write_html(fig, plot_html_path, auto_open=False)
-        if params[0].split('_')[6].split('=')[1] != params[1].split('_')[6].split('=')[1]:
-            break
-
-    # Export Info
-    try:
-        print(f'Access to interactive plot at: {"/".join(plot_html_path.split("/")[:-1] + [plot_html_path.split(names[1])[1]])}')
-        klippy.write(f'M118 Access to interactive plot at: {"/".join(plot_html_path.split("/")[:-1] + [plot_html_path.split(names[1])[1]])} \r\n'.encode('utf-8'))
-    except IndexError:
         print(f'Access to interactive plot at: {plot_html_path}')
-        klippy.write(f'M118 Access to interactive plot at: {plot_html_path} \r\n'.encode('utf-8'))
+        klippy_write(f'M118 Access to interactive plot at: {plot_html_path} \r\n'.encode('utf-8'))
 
 
 if __name__ == '__main__':
-        if sys.argv[1] == 'cleaner':
-            cleaner()
-        else:
-            try:
-                check_export_path(RESULTS_FOLDER)
-                main()
-            except:
-                klippy = serial.Serial(os.path.expanduser('~/printer_data/comms/klippy.serial'), 115200)
-                klippy.write('RESPOND TYPE=error MSG="WARNING!!! FATAL ERROR IN PLOTTER" \n'.encode('utf-8'))
+    own_dir = os.path.dirname(sys.argv[0])
+    try:
+        check_export_path(RESULTS_FOLDER)
+        main(own_dir)
+    except Exception as e:
+        klippy_write('RESPOND TYPE=error MSG="WARNING!!! FATAL ERROR IN PLOTTER" \n'.encode('utf-8'))
+        raise e
